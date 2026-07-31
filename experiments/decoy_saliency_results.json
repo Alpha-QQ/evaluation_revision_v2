@@ -1,0 +1,62 @@
+{
+  "uniform": [
+    {
+      "n": 50,
+      "top1_accuracy": 0.968,
+      "baseline": 0.02,
+      "eps_dec_hat": 0.948,
+      "ci95_halfwidth": 0.007713540095183279
+    },
+    {
+      "n": 100,
+      "top1_accuracy": 0.938,
+      "baseline": 0.01,
+      "eps_dec_hat": 0.9279999999999999,
+      "ci95_halfwidth": 0.010569108041835891
+    },
+    {
+      "n": 200,
+      "top1_accuracy": 0.902,
+      "baseline": 0.005,
+      "eps_dec_hat": 0.897,
+      "ci95_halfwidth": 0.01303038897347274
+    },
+    {
+      "n": 500,
+      "top1_accuracy": 0.858,
+      "baseline": 0.002,
+      "eps_dec_hat": 0.856,
+      "ci95_halfwidth": 0.015297796860986226
+    }
+  ],
+  "matched": [
+    {
+      "n": 50,
+      "top1_accuracy": 0.0155,
+      "baseline": 0.02,
+      "eps_dec_hat": -0.0045000000000000005,
+      "ci95_halfwidth": 0.005413956760078529
+    },
+    {
+      "n": 100,
+      "top1_accuracy": 0.011,
+      "baseline": 0.01,
+      "eps_dec_hat": 0.0009999999999999992,
+      "ci95_halfwidth": 0.0045712561949643555
+    },
+    {
+      "n": 200,
+      "top1_accuracy": 0.0045,
+      "baseline": 0.005,
+      "eps_dec_hat": -0.0005000000000000004,
+      "ci95_halfwidth": 0.0029333775413335392
+    },
+    {
+      "n": 500,
+      "top1_accuracy": 0.0015,
+      "baseline": 0.002,
+      "eps_dec_hat": -0.0005,
+      "ci95_halfwidth": 0.0016961362563190493
+    }
+  ]
+}

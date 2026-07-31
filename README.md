@@ -12,6 +12,9 @@ artifacts for the proposed DID/VC privacy framework.
 - `test_proposed_protocol.py`: protocol correctness and rejection checks.
 - `results_for_paper_v2.json`: environment metadata and summarized measurements
   used in the paper.
+- `experiments/decoy_saliency.py`: fixed-seed decoy-saliency experiment from
+  Section 6.3 of the manuscript.
+- `experiments/decoy_saliency_results.json`: recorded output used in the paper.
 
 ## Run
 
@@ -25,3 +28,15 @@ The benchmark reports latency, peak Python-traced memory, and serialized
 artifact size. These are distinct measurements: `tracemalloc` records peak
 traced allocations, while serialized size is the UTF-8 byte length of the
 compact JSON artifact.
+
+## Decoy-saliency experiment
+
+Run the population-matched and uniform decoy-source experiment from the
+repository root:
+
+```text
+python experiments/decoy_saliency.py
+```
+
+The fixed-seed experiment evaluates candidate-set sizes 50, 100, 200, and 500
+and writes `experiments/decoy_saliency_results.json`.

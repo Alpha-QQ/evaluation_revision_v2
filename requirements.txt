@@ -1,2 +1,4 @@
 coincurve==21.0.0
 ecdsa==0.19.2
+numpy==2.0.2
+scikit-learn==1.6.1
