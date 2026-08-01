@@ -134,18 +134,16 @@ def main() -> None:
         "holder_public_key": holder_key.public_key.format(
             compressed=True
         ).hex(),
-        "credential_status": {
-            "entry": "authentic",
-            "state": "ok",
-            "source": "issuer",
-        },
+        "valid_until": "2030-01-01T00:00:00Z",
     }
     issuer_signature = issue_credential(issuer_key, authentic_credential)
     issuer_whitelist = [issuer_key.public_key, *issuer_ring_keys]
     credential_schema = list(authentic_credential)
     warmup_context = {
         "session_id": secrets.token_hex(16),
+        "schema_id": "urn:example:benchmark-credential:v1",
         "policy": [attributes[0]],
+        "validity_epoch": authentic_credential["valid_until"],
     }
 
     warmup = sign_urs_dvs(
@@ -182,7 +180,9 @@ def main() -> None:
             for run in range(1, args.repeats + 1):
                 context = {
                     "session_id": secrets.token_hex(16),
+                    "schema_id": "urn:example:benchmark-credential:v1",
                     "policy": sorted(reveal_keys),
+                    "validity_epoch": authentic_credential["valid_until"],
                 }
 
                 def generate():
@@ -234,14 +234,12 @@ def main() -> None:
                 })
 
                 completed += 1
-                print(
-                    f"\rCompleted {completed}/{total}: "
-                    f"n={candidate_size}, attributes={attribute_count}, run={run}",
-                    end="",
-                    flush=True,
-                )
             write_csv(raw_path, raw_rows)
-    print()
+            print(
+                f"Completed {completed}/{total}: "
+                f"n={candidate_size}, attributes={attribute_count}",
+                flush=True,
+            )
 
     summary_rows = []
     for candidate_size in args.candidate_sizes:
@@ -288,9 +286,9 @@ def main() -> None:
         "platform": platform.platform(),
         "curve": "secp256k1",
         "hash": "SHA-256",
-        "urs": "Tso US(1,n) Schnorr conversion with cyclic witness-hiding proof",
+        "urs": "Tso US(1,n) Schnorr conversion",
         "sdvs": "Saeednia-Kremer-Markowitch (r,s,t) construction",
-        "linkage_proof": "Fiat-Shamir Chaum-Pedersen Sigma-OR",
+        "binding_proof": "Fiat-Shamir same-index Schnorr-and-Chaum-Pedersen Sigma-OR",
         "serialization": "canonical compact JSON (UTF-8)",
         "garbage_collection": "gc.collect() before each measured call",
         "confidence_interval": "normal-approximation 95% CI",
