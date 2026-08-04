@@ -22,6 +22,7 @@ SYSTEM_RANDOM = secrets.SystemRandom()
 METADATA_FIELDS = {
     "issuer_public_key",
     "holder_public_key",
+    "credential_status",
 }
 
 
@@ -139,6 +140,83 @@ def verify_credential(
         return False
 
 
+def _urs_wh_prove(
+    witness: int,
+    authentic_index: int,
+    deltas: List[PublicKey],
+) -> Dict[str, Any]:
+    n = len(deltas)
+    delta_list = _canonical_json(
+        [_point_bytes(delta).hex() for delta in deltas]
+    )
+    while True:
+        challenges = [0] * n
+        omega = [0] * n
+        beta = _random_scalar()
+        next_index = (authentic_index + 1) % n
+        challenges[next_index] = _hash_scalar(
+            b"DIDVC-URS-WH-v1",
+            next_index.to_bytes(8, "big"),
+            delta_list,
+            _point_bytes(_scalar_mul_g(beta)),
+        )
+        index = next_index
+        try:
+            while index != authentic_index:
+                omega[index] = _random_scalar()
+                commitment = _linear_combination(
+                    (G, omega[index]), (deltas[index], challenges[index])
+                )
+                following = (index + 1) % n
+                challenges[following] = _hash_scalar(
+                    b"DIDVC-URS-WH-v1",
+                    following.to_bytes(8, "big"),
+                    delta_list,
+                    _point_bytes(commitment),
+                )
+                index = following
+            omega[authentic_index] = (
+                beta - witness * challenges[authentic_index]
+            ) % ORDER
+            if challenges[0] and all(value != 0 for value in omega):
+                return {
+                    "c1": hex(challenges[0]),
+                    "omega": [hex(value) for value in omega],
+                }
+        except ValueError:
+            continue
+
+
+def _urs_wh_verify(
+    deltas: List[PublicKey],
+    proof: Dict[str, Any],
+) -> bool:
+    try:
+        initial = int(proof["c1"], 16) % ORDER
+        omega = [int(value, 16) % ORDER for value in proof["omega"]]
+        n = len(deltas)
+        if not initial or len(omega) != n or any(value == 0 for value in omega):
+            return False
+        delta_list = _canonical_json(
+            [_point_bytes(delta).hex() for delta in deltas]
+        )
+        challenge = initial
+        for index in range(n):
+            commitment = _linear_combination(
+                (G, omega[index]), (deltas[index], challenge)
+            )
+            following = (index + 1) % n
+            challenge = _hash_scalar(
+                b"DIDVC-URS-WH-v1",
+                following.to_bytes(8, "big"),
+                delta_list,
+                _point_bytes(commitment),
+            )
+        return challenge == initial
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _urs_convert(
     authentic_message: bytes,
     issuer_signature: Dict[str, str],
@@ -177,11 +255,17 @@ def _urs_convert(
             except ValueError:
                 continue
 
+    wh_proof = _urs_wh_prove(
+        genuine_s,
+        authentic_index,
+        deltas,
+    )
     return {
         "PK": [_point_bytes(key).hex() for key in issuer_ring],
         "M": [message.hex() for message in messages],
         "r": [hex(value) for value in r_values],
         "delta": [_point_bytes(delta).hex() for delta in deltas],
+        "WH": wh_proof,
     }
 
 
@@ -207,7 +291,7 @@ def _urs_verify(urs: Dict[str, Any]) -> bool:
             )
             if challenge != expected:
                 return False
-        return True
+        return _urs_wh_verify(deltas, urs["WH"])
     except (KeyError, TypeError, ValueError):
         return False
 
@@ -262,12 +346,9 @@ def _sdvs_simulate(
     while True:
         s_prime = _random_scalar()
         r_prime = _random_scalar()
-        try:
-            commitment = _linear_combination(
-                (base, s_prime), (signer_vk, r_prime)
-            )
-        except ValueError:
-            continue
+        commitment = _linear_combination(
+            (base, s_prime), (signer_vk, r_prime)
+        )
         r = _hash_scalar(b"DIDVC-SDVS-v1", message, _point_bytes(commitment))
         ell = r_prime * pow(r, -1, ORDER) % ORDER
         s = s_prime * pow(ell, -1, ORDER) % ORDER
@@ -276,48 +357,33 @@ def _sdvs_simulate(
             return {"r": hex(r), "s": hex(s), "t": hex(t)}
 
 
-def _binding_challenge(
+def _link_challenge(
     context: bytes,
     verifier_vk: PublicKey,
     messages: List[bytes],
     issuer_ring: List[PublicKey],
-    signature_challenges: List[int],
-    deltas: List[PublicKey],
     base: PublicKey,
     session_vk: PublicKey,
-    signature_commitments: List[PublicKey],
-    holder_commitments: List[PublicKey],
-    session_commitments: List[PublicKey],
+    commitments_1: List[PublicKey],
+    commitments_2: List[PublicKey],
 ) -> int:
     return _hash_scalar(
-        b"DIDVC-Same-Index-Binding-v1",
+        b"DIDVC-Link-v1",
         context,
         _point_bytes(verifier_vk),
         _canonical_json([message.hex() for message in messages]),
         _canonical_json([_point_bytes(key).hex() for key in issuer_ring]),
-        _canonical_json([hex(value) for value in signature_challenges]),
-        _canonical_json([_point_bytes(delta).hex() for delta in deltas]),
         _point_bytes(base),
         _point_bytes(session_vk),
         b"".join(
-            _point_bytes(first)
-            + _point_bytes(second)
-            + _point_bytes(third)
-            for first, second, third in zip(
-                signature_commitments,
-                holder_commitments,
-                session_commitments,
-            )
+            _point_bytes(first) + _point_bytes(second)
+            for first, second in zip(commitments_1, commitments_2)
         ),
     )
 
 
-def _binding_prove(
-    issuer_response: int,
+def _link_prove(
     holder_sk: Any,
-    authentic_index: int,
-    signature_challenges: List[int],
-    deltas: List[PublicKey],
     holder_ring: List[PublicKey],
     base: PublicKey,
     context: bytes,
@@ -326,99 +392,61 @@ def _binding_prove(
     issuer_ring: List[PublicKey],
 ) -> Dict[str, Any]:
     x = _priv_int(holder_sk)
-    if _point_bytes(holder_ring[authentic_index]) != _point_bytes(_to_pub(holder_sk)):
-        raise ValueError("issuer and holder witnesses must use the same index")
-    if _point_bytes(deltas[authentic_index]) != _point_bytes(
-        _scalar_mul_g(issuer_response)
-    ):
-        raise ValueError("issuer response is not aligned with the authentic index")
+    holder_vk = _to_pub(holder_sk)
+    encodings = [_point_bytes(key) for key in holder_ring]
+    authentic_index = encodings.index(_point_bytes(holder_vk))
     session_vk = _scalar_mul(base, x)
     n = len(holder_ring)
 
     while True:
         challenges = [0] * n
-        signature_responses = [0] * n
-        holder_responses = [0] * n
-        signature_commitments: List[Optional[PublicKey]] = [None] * n
-        holder_commitments: List[Optional[PublicKey]] = [None] * n
-        session_commitments: List[Optional[PublicKey]] = [None] * n
-        signature_nonce = _random_scalar()
-        holder_nonce = _random_scalar()
-        signature_commitments[authentic_index] = _scalar_mul_g(signature_nonce)
-        holder_commitments[authentic_index] = _scalar_mul_g(holder_nonce)
-        session_commitments[authentic_index] = _scalar_mul(base, holder_nonce)
-        try:
-            for index in range(n):
-                if index == authentic_index:
-                    continue
-                challenges[index] = _random_scalar()
-                signature_responses[index] = _random_scalar()
-                holder_responses[index] = _random_scalar()
-                signature_commitments[index] = _linear_combination(
-                    (G, signature_responses[index]),
-                    (deltas[index], -challenges[index]),
-                )
-                holder_commitments[index] = _linear_combination(
-                    (G, holder_responses[index]),
-                    (holder_ring[index], -challenges[index]),
-                )
-                session_commitments[index] = _linear_combination(
-                    (base, holder_responses[index]),
-                    (session_vk, -challenges[index]),
-                )
-            signature_points = [
-                point for point in signature_commitments if point is not None
-            ]
-            holder_points = [
-                point for point in holder_commitments if point is not None
-            ]
-            session_points = [
-                point for point in session_commitments if point is not None
-            ]
-            overall = _binding_challenge(
-                context,
-                verifier_vk,
-                messages,
-                issuer_ring,
-                signature_challenges,
-                deltas,
-                base,
-                session_vk,
-                signature_points,
-                holder_points,
-                session_points,
+        responses = [0] * n
+        first: List[Optional[PublicKey]] = [None] * n
+        second: List[Optional[PublicKey]] = [None] * n
+        nonce = _random_scalar()
+        first[authentic_index] = _scalar_mul_g(nonce)
+        second[authentic_index] = _scalar_mul(base, nonce)
+        for index in range(n):
+            if index == authentic_index:
+                continue
+            challenges[index] = _random_scalar()
+            responses[index] = _random_scalar()
+            first[index] = _linear_combination(
+                (G, responses[index]),
+                (holder_ring[index], -challenges[index]),
             )
-            real_challenge = (
-                overall
-                - sum(
-                    challenges[index]
-                    for index in range(n)
-                    if index != authentic_index
-                )
-            ) % ORDER
-            real_signature_response = (
-                signature_nonce + real_challenge * issuer_response
-            ) % ORDER
-            real_holder_response = (
-                holder_nonce + real_challenge * x
-            ) % ORDER
-        except ValueError:
-            continue
-        if real_challenge and real_signature_response and real_holder_response:
+            second[index] = _linear_combination(
+                (base, responses[index]),
+                (session_vk, -challenges[index]),
+            )
+        first_points = [point for point in first if point is not None]
+        second_points = [point for point in second if point is not None]
+        overall = _link_challenge(
+            context,
+            verifier_vk,
+            messages,
+            issuer_ring,
+            base,
+            session_vk,
+            first_points,
+            second_points,
+        )
+        real_challenge = (
+            overall
+            - sum(challenges[index] for index in range(n) if index != authentic_index)
+        ) % ORDER
+        real_response = (nonce + real_challenge * x) % ORDER
+        if real_challenge and real_response:
             challenges[authentic_index] = real_challenge
-            signature_responses[authentic_index] = real_signature_response
-            holder_responses[authentic_index] = real_holder_response
+            responses[authentic_index] = real_response
             return {
                 "c": [hex(value) for value in challenges],
-                "z_sig": [hex(value) for value in signature_responses],
-                "z_holder": [hex(value) for value in holder_responses],
+                "z": [hex(value) for value in responses],
             }
 
 
-def _binding_verify(
+def _link_verify(
     proof: Dict[str, Any],
-    signature_challenges: List[int],
-    deltas: List[PublicKey],
     holder_ring: List[PublicKey],
     base: PublicKey,
     session_vk: PublicKey,
@@ -429,59 +457,35 @@ def _binding_verify(
 ) -> bool:
     try:
         challenges = [int(value, 16) % ORDER for value in proof["c"]]
-        signature_responses = [
-            int(value, 16) % ORDER for value in proof["z_sig"]
-        ]
-        holder_responses = [
-            int(value, 16) % ORDER for value in proof["z_holder"]
-        ]
+        responses = [int(value, 16) % ORDER for value in proof["z"]]
         n = len(holder_ring)
-        if not (
-            len(challenges)
-            == len(signature_responses)
-            == len(holder_responses)
-            == len(deltas)
-            == n
-        ):
+        if not (len(challenges) == len(responses) == n):
             return False
-        if any(
-            value == 0
-            for value in challenges + signature_responses + holder_responses
-        ):
+        if any(value == 0 for value in challenges + responses):
             return False
-        signature_commitments = [
+        first = [
             _linear_combination(
-                (G, signature_responses[index]),
-                (deltas[index], -challenges[index]),
-            )
-            for index in range(n)
-        ]
-        holder_commitments = [
-            _linear_combination(
-                (G, holder_responses[index]),
+                (G, responses[index]),
                 (holder_ring[index], -challenges[index]),
             )
             for index in range(n)
         ]
-        session_commitments = [
+        second = [
             _linear_combination(
-                (base, holder_responses[index]),
+                (base, responses[index]),
                 (session_vk, -challenges[index]),
             )
             for index in range(n)
         ]
-        overall = _binding_challenge(
+        overall = _link_challenge(
             context,
             verifier_vk,
             messages,
             issuer_ring,
-            signature_challenges,
-            deltas,
             base,
             session_vk,
-            signature_commitments,
-            holder_commitments,
-            session_commitments,
+            first,
+            second,
         )
         return sum(challenges) % ORDER == overall
     except (KeyError, TypeError, ValueError):
@@ -549,29 +553,31 @@ def sign_urs_dvs(
             seen_issuers.add(encoded)
         if len(issuer_ring) == ring_size:
             break
-    if len(issuer_ring) < ring_size:
-        raise ValueError(
-            "the authorized issuer-key set is smaller than ring_size"
-        )
+    while len(issuer_ring) < ring_size:
+        public_key = PrivateKey().public_key
+        encoded = _point_bytes(public_key)
+        if encoded not in seen_issuers:
+            issuer_ring.append(public_key)
+            seen_issuers.add(encoded)
 
     authentic = _credential(message)
     if not METADATA_FIELDS.issubset(authentic):
         raise ValueError(
-            "the issuer-signed credential must contain issuer and holder keys"
+            "the issuer-signed credential must contain issuer, holder, and status metadata"
         )
-    if "valid_until" not in authentic:
-        raise ValueError("the credential must contain an issuer-signed valid_until field")
     holder_vk = _to_pub(holder_sk)
     if authentic["issuer_public_key"] != _point_bytes(authentic_issuer).hex():
         raise ValueError("credential issuer key does not match issuer_vk")
     if authentic["holder_public_key"] != _point_bytes(holder_vk).hex():
         raise ValueError("credential holder key does not match holder_sk")
+    if not isinstance(authentic["credential_status"], dict):
+        raise ValueError("credential_status must be an object")
     attrs = {
         field: value
         for field, value in authentic.items()
         if field not in METADATA_FIELDS
     }
-    disclosed = set(reveal_keys or []) | {"valid_until"}
+    disclosed = set(reveal_keys or [])
     if not disclosed.issubset(attrs):
         raise ValueError("reveal_keys must be fields in the genuine credential")
     candidates = [authentic]
@@ -589,6 +595,11 @@ def sign_urs_dvs(
                     issuer_ring[candidate_index]
                 ).hex(),
                 "holder_public_key": _point_bytes(decoy_holder).hex(),
+                "credential_status": {
+                    "entry": f"decoy-{candidate_index}",
+                    "state": "ok",
+                    "source": "holder-mask",
+                },
             }
         )
 
@@ -622,17 +633,9 @@ def sign_urs_dvs(
     verifier_public = _to_pub(verifier_vk)
     verifier_session_vk = _scalar_mul(verifier_public, base_scalar)
     holder_ring = _holder_ring_from_messages(messages)
-    signature_challenges = [
-        int(value, 16) % ORDER for value in urs["r"]
-    ]
-    deltas = _decode_points(urs["delta"])
 
-    binding_proof = _binding_prove(
-        int(issuer_signature["s"], 16) % ORDER,
+    link_proof = _link_prove(
         holder_sk,
-        authentic_index,
-        signature_challenges,
-        deltas,
         holder_ring,
         base,
         context_bytes,
@@ -640,23 +643,22 @@ def sign_urs_dvs(
         messages,
         issuer_ring,
     )
-    mu = {
-        "context": context,
-        "urs": urs,
-        "h": _point_bytes(base).hex(),
-        "pkVP": _point_bytes(session_vk).hex(),
-        "binding_proof": binding_proof,
-    }
+    mu = urs
     mu_bytes = _canonical_json(mu)
     sdvs = _sdvs_sign(
         holder_sk, verifier_session_vk, base, mu_bytes
     )
 
     return {
+        "context": context,
         "vp": {
             "mu": mu,
             "sdvs": sdvs,
+            "pkVP": _point_bytes(session_vk).hex(),
         },
+        "h": _point_bytes(base).hex(),
+        "pkVP": _point_bytes(session_vk).hex(),
+        "link_proof": link_proof,
     }
 
 
@@ -670,20 +672,18 @@ def verify_urs_dvs(
 ) -> Tuple[bool, bool]:
     try:
         verifier_vk = _to_pub(verifier_sk)
-        mu = bundle["vp"]["mu"]
-        base = PublicKey(bytes.fromhex(mu["h"]))
-        session_vk = PublicKey(bytes.fromhex(mu["pkVP"]))
-        urs = mu["urs"]
-        if not _urs_verify(urs):
+        base = PublicKey(bytes.fromhex(bundle["h"]))
+        session_vk = PublicKey(bytes.fromhex(bundle["pkVP"]))
+        if bundle["vp"]["pkVP"] != bundle["pkVP"]:
             return False, False
-        messages = [bytes.fromhex(value) for value in urs["M"]]
-        issuer_ring = _decode_points(urs["PK"])
-        deltas = _decode_points(urs["delta"])
-        signature_challenges = [
-            int(value, 16) % ORDER for value in urs["r"]
-        ]
+
+        mu = bundle["vp"]["mu"]
+        if not _urs_verify(mu):
+            return False, False
+        messages = [bytes.fromhex(value) for value in mu["M"]]
+        issuer_ring = _decode_points(mu["PK"])
         holder_ring = _holder_ring_from_messages(messages)
-        context_bytes = _canonical_json(mu["context"])
+        context_bytes = _canonical_json(bundle["context"])
         if _canonical_json(expected_context) != context_bytes:
             return False, False
 
@@ -695,7 +695,7 @@ def verify_urs_dvs(
 
         parsed_messages = [json.loads(message) for message in messages]
         if any(
-            parsed["issuer_public_key"] != urs["PK"][index]
+            parsed["issuer_public_key"] != mu["PK"][index]
             for index, parsed in enumerate(parsed_messages)
         ):
             return False, False
@@ -704,9 +704,7 @@ def verify_urs_dvs(
             set(parsed) != schema for parsed in parsed_messages[1:]
         ):
             return False, False
-        policy = mu["context"].get("policy")
-        if not isinstance(mu["context"].get("schema_id"), str):
-            return False, False
+        policy = bundle["context"].get("policy")
         if not isinstance(policy, list) or any(
             field not in schema for field in policy
         ):
@@ -718,11 +716,11 @@ def verify_urs_dvs(
         ):
             return False, False
 
-        validity_epoch = mu["context"].get("validity_epoch")
-        if not isinstance(validity_epoch, str) or any(
-            parsed.get("valid_until") != validity_epoch
+        status_ok = all(
+            parsed["credential_status"]["state"] == "ok"
             for parsed in parsed_messages
-        ):
+        )
+        if not status_ok:
             return False, False
 
         sdvs_ok = _sdvs_verify(
@@ -732,10 +730,8 @@ def verify_urs_dvs(
             base,
             _canonical_json(mu),
         )
-        binding_ok = _binding_verify(
-            mu["binding_proof"],
-            signature_challenges,
-            deltas,
+        link_ok = _link_verify(
+            bundle["link_proof"],
             holder_ring,
             base,
             session_vk,
@@ -744,7 +740,7 @@ def verify_urs_dvs(
             messages,
             issuer_ring,
         )
-        return sdvs_ok and binding_ok, binding_ok
+        return sdvs_ok and link_ok, link_ok
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False, False
 
@@ -752,14 +748,13 @@ def verify_urs_dvs(
 def simulate_sdvs(
     bundle: Dict[str, Any], verifier_sk: Any
 ) -> Dict[str, str]:
-    mu = bundle["vp"]["mu"]
-    base = PublicKey(bytes.fromhex(mu["h"]))
-    session_vk = PublicKey(bytes.fromhex(mu["pkVP"]))
+    base = PublicKey(bytes.fromhex(bundle["h"]))
+    session_vk = PublicKey(bytes.fromhex(bundle["pkVP"]))
     return _sdvs_simulate(
         verifier_sk,
         session_vk,
         base,
-        _canonical_json(mu),
+        _canonical_json(bundle["vp"]["mu"]),
     )
 
 
@@ -793,51 +788,47 @@ if __name__ == "__main__":
         **attrs,
         "issuer_public_key": _point_bytes(issuer_sk).hex(),
         "holder_public_key": _point_bytes(holder_sk).hex(),
-        "valid_until": "2030-01-01T00:00:00Z",
+        "credential_status": {
+            "entry": "authentic",
+            "state": "ok",
+            "source": "issuer",
+        },
     }
     issuer_signature = issue_credential(issuer_sk, genuine)
-    issuer_candidates = [PrivateKey().public_key for _ in range(9)]
-    context = {
-        "session_id": "demo-session",
-        "schema_id": "urn:example:credential:v1",
-        "policy": ["name"],
-        "validity_epoch": genuine["valid_until"],
-    }
     bundle = sign_urs_dvs(
         holder_sk,
-        issuer_candidates,
+        [],
         genuine,
         issuer_signature,
         verifier_sk.public_key,
         issuer_vk=issuer_sk.public_key,
         reveal_keys=["name"],
         ring_size=10,
-        context=context,
+        context={"session_id": "demo-session", "policy": ["name"]},
     )
     issuer_whitelist = [
-        PublicKey(bytes.fromhex(value))
-        for value in bundle["vp"]["mu"]["urs"]["PK"]
+        PublicKey(bytes.fromhex(value)) for value in bundle["vp"]["mu"]["PK"]
     ]
     assert verify_urs_dvs(
         bundle,
         verifier_sk,
         issuer_whitelist,
-        expected_context=context,
+        expected_context={"session_id": "demo-session", "policy": ["name"]},
         expected_schema=list(genuine),
     )[0]
     simulated = simulate_sdvs(bundle, verifier_sk)
     assert _sdvs_verify(
         simulated,
         verifier_sk,
-        PublicKey(bytes.fromhex(bundle["vp"]["mu"]["pkVP"])),
-        PublicKey(bytes.fromhex(bundle["vp"]["mu"]["h"])),
+        PublicKey(bytes.fromhex(bundle["pkVP"])),
+        PublicKey(bytes.fromhex(bundle["h"])),
         _canonical_json(bundle["vp"]["mu"]),
     )
     assert not verify_urs_dvs(
         bundle,
         PrivateKey(),
         issuer_whitelist,
-        expected_context=context,
+        expected_context={"session_id": "demo-session", "policy": ["name"]},
         expected_schema=list(genuine),
     )[0]
     print("protocol self-test passed")
