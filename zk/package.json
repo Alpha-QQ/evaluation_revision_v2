@@ -1,0 +1,10 @@
+{
+  "name": "credential-comparison-zk",
+  "private": true,
+  "description": "Groth16 selective-disclosure benchmark used by comparison.py",
+  "dependencies": {
+    "circomlib": "2.0.5",
+    "circomlibjs": "0.1.7",
+    "snarkjs": "0.7.5"
+  }
+}

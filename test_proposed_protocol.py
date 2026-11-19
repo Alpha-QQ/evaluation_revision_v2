@@ -4,159 +4,139 @@ import unittest
 
 from coincurve import PrivateKey
 
-from proposed import (
-    issue_credential,
-    sign_urs_dvs,
-    simulate_sdvs,
-    verify_urs_dvs,
-)
+import proposed as P
+
+ATTRS = {"name": "Alice", "age": 25, "nationality": "Taiwan", "level": 4,
+         "member": False, "verified": True}
 
 
-class ProposedProtocolTests(unittest.TestCase):
+def _setup(n=8):
+    issuer = PrivateKey()
+    verifier = PrivateKey()
+    issuer_pool = [issuer.public_key] + [PrivateKey().public_key for _ in range(5)]
+    holder_pool = [PrivateKey().public_key for _ in range(3 * n)]
+    holder_sk = PrivateKey()
+    cred = P.make_credential(issuer, holder_sk.public_key, ATTRS, 17)
+    sig = P.issue_credential(issuer, cred)
+    holder = P.Holder(holder_sk, cred, sig, issuer.public_key,
+                      P.random_cover(n, issuer_pool, holder_pool))
+    return issuer, verifier, issuer_pool, holder_pool, holder, cred
+
+
+class RevisedProtocolTests(unittest.TestCase):
     def setUp(self):
-        self.holder_sk = PrivateKey()
-        self.issuer_sk = PrivateKey()
-        self.verifier_sk = PrivateKey()
-        self.attributes = {
-            "name": "Alice",
-            "age": 25,
-            "score": 88,
-            "nationality": "Taiwan",
-            "level": 4,
-            "experience": 6,
-            "gender": 0,
-            "login_days": 62,
-            "purchase_count": 13,
-            "review_score": 74,
-            "contribution": 32,
-            "training_hours": 7,
-            "active": True,
-            "member": False,
-            "passed_kyc": False,
-            "admin": True,
-            "certified": True,
-            "has_photo": True,
-            "verified": True,
-            "student": False,
-        }
-        self.authentic = {
-            **self.attributes,
-            "issuer_public_key": self.issuer_sk.public_key.format(
-                compressed=True
-            ).hex(),
-            "holder_public_key": self.holder_sk.public_key.format(
-                compressed=True
-            ).hex(),
-            "credential_status": {
-                "entry": "issuer-status-17",
-                "state": "ok",
-                "source": "issuer",
-            },
-        }
-        issuer_signature = issue_credential(self.issuer_sk, self.authentic)
-        self.issuer_ring = [
-            self.issuer_sk.public_key,
-            *[PrivateKey().public_key for _ in range(7)],
-        ]
-        self.context = {
-            "session_id": "test-session",
-            "policy": ["age", "name"],
-        }
-        self.schema = list(self.authentic)
-        self.bundle = sign_urs_dvs(
-            self.holder_sk,
-            self.issuer_ring[1:],
-            self.authentic,
-            issuer_signature,
-            self.verifier_sk.public_key,
-            issuer_vk=self.issuer_sk.public_key,
-            reveal_keys=["name", "age"],
-            ring_size=8,
-            context=self.context,
-        )
+        (self.issuer, self.verifier, self.wl, self.pool,
+         self.holder, self.cred) = _setup()
+        self.ctx = {"session_id": "s-1", "policy": ["age", "nationality"]}
+        self.schema = list(self.cred)
+        self.t = P.present(self.holder, self.verifier.public_key, self.ctx)
 
-    def verify(self, bundle=None, verifier_sk=None, whitelist=None, schema=None):
-        return verify_urs_dvs(
-            bundle or self.bundle,
-            verifier_sk or self.verifier_sk,
-            whitelist or self.issuer_ring,
-            expected_context=self.context,
-            expected_schema=schema or self.schema,
-        )
+    def verify(self, t=None, verifier=None, wl=None, ctx=None, revoked=None):
+        return P.verify_presentation(
+            t or self.t, verifier or self.verifier, wl or self.wl,
+            expected_context=ctx or self.ctx, expected_schema=self.schema,
+            revoked=revoked)
 
-    def test_valid_transcript(self):
-        self.assertEqual(self.verify(), (True, True))
+    def test_valid(self):
+        self.assertTrue(self.verify())
 
-    def test_wrong_designated_verifier_rejected(self):
-        self.assertEqual(
-            self.verify(verifier_sk=PrivateKey()),
-            (False, False),
-        )
+    def test_wrong_verifier(self):
+        self.assertFalse(self.verify(verifier=PrivateKey()))
 
-    def test_message_tampering_rejected(self):
-        tampered = copy.deepcopy(self.bundle)
-        message = json.loads(bytes.fromhex(tampered["vp"]["mu"]["M"][0]))
-        message["age"] = 99
-        tampered["vp"]["mu"]["M"][0] = json.dumps(
-            message, sort_keys=True, separators=(",", ":")
-        ).encode().hex()
-        self.assertFalse(self.verify(tampered)[0])
+    def test_message_tampering(self):
+        t = copy.deepcopy(self.t)
+        m = json.loads(bytes.fromhex(t["M"][0]))
+        m["level"] = 99
+        t["M"][0] = P.canonical_json(m).hex()
+        self.assertFalse(self.verify(t))
 
-    def test_candidate_reordering_rejected(self):
-        tampered = copy.deepcopy(self.bundle)
-        tampered["vp"]["mu"]["M"][0], tampered["vp"]["mu"]["M"][1] = (
-            tampered["vp"]["mu"]["M"][1],
-            tampered["vp"]["mu"]["M"][0],
-        )
-        self.assertFalse(self.verify(tampered)[0])
+    def test_reordering(self):
+        t = copy.deepcopy(self.t)
+        for k in ("M", "PK", "r", "delta"):
+            t[k][0], t[k][1] = t[k][1], t[k][0]
+        self.assertFalse(self.verify(t))
 
-    def test_context_substitution_rejected(self):
-        tampered = copy.deepcopy(self.bundle)
-        tampered["context"]["session_id"] = "other-session"
-        self.assertFalse(self.verify(tampered)[0])
+    def test_context_substitution(self):
+        t = copy.deepcopy(self.t)
+        t["context"] = {"session_id": "s-2", "policy": self.ctx["policy"]}
+        self.assertFalse(self.verify(t, ctx=t["context"]))
 
-    def test_non_whitelisted_issuer_rejected(self):
-        incomplete_whitelist = self.issuer_ring[:-1]
-        self.assertFalse(self.verify(whitelist=incomplete_whitelist)[0])
+    def test_non_whitelisted(self):
+        used = set(self.t["PK"])
+        wl = [k for k in self.wl if k.format(compressed=True).hex() != sorted(used)[0]]
+        self.assertFalse(self.verify(wl=wl))
 
-    def test_disclosed_field_mismatch_rejected(self):
-        tampered = copy.deepcopy(self.bundle)
-        message = json.loads(bytes.fromhex(tampered["vp"]["mu"]["M"][0]))
-        message["name"] = "Mallory"
-        tampered["vp"]["mu"]["M"][0] = json.dumps(
-            message, sort_keys=True, separators=(",", ":")
-        ).encode().hex()
-        self.assertFalse(self.verify(tampered)[0])
+    def test_disclosed_mismatch(self):
+        t = copy.deepcopy(self.t)
+        m = json.loads(bytes.fromhex(t["M"][0]))
+        m["age"] = 30
+        t["M"][0] = P.canonical_json(m).hex()
+        self.assertFalse(self.verify(t))
 
-    def test_verifier_simulation_is_accepted(self):
-        simulated = copy.deepcopy(self.bundle)
-        simulated["vp"]["sdvs"] = simulate_sdvs(
-            simulated, self.verifier_sk
-        )
-        self.assertEqual(self.verify(simulated), (True, True))
+    def test_revoked_authentic(self):
+        revoked = {self.cred["issuer_public_key"]: {17}}
+        self.assertFalse(self.verify(revoked=revoked))
 
-    def test_issuer_status_is_preserved(self):
-        messages = [
-            json.loads(bytes.fromhex(value))
-            for value in self.bundle["vp"]["mu"]["M"]
-        ]
-        genuine = next(
-            message
-            for message in messages
-            if message["issuer_public_key"]
-            == self.authentic["issuer_public_key"]
-        )
-        self.assertEqual(
-            genuine["credential_status"],
-            self.authentic["credential_status"],
-        )
+    def test_unrevoked_passes_status_check(self):
+        self.assertTrue(self.verify(revoked={}))
 
-    def test_unexpected_schema_rejected(self):
-        self.assertFalse(self.verify(schema=self.schema[:-1])[0])
+    def test_decoy_status_avoids_revoked_entries(self):
+        # half of every cover issuer's list is revoked; the holder must avoid it
+        revoked = {P._pb(k).hex(): set(range(0, P.STATUS_LIST_SIZE, 2)) for k in self.wl}
+        for key in revoked:
+            revoked[key].discard(17)
+        self.holder.status_lists = revoked
+        self.holder.cache.clear()
+        t = P.present(self.holder, self.verifier.public_key, self.ctx)
+        self.assertTrue(self.verify(t=t, revoked=revoked))
 
-    def test_transcript_has_no_redundant_verifier_keys(self):
-        self.assertNotIn("verifier_pub", self.bundle)
-        self.assertNotIn("verifier_session_pub", self.bundle)
+    def test_rows_have_uniform_shape(self):
+        rows = [json.loads(bytes.fromhex(m)) for m in self.t["M"]]
+        self.assertEqual({tuple(sorted(r["credential_status"])) for r in rows}, {("index",)})
+        self.assertFalse(any("decoy" in json.dumps(r) for r in rows))
+
+    def test_same_policy_reuses_rows(self):
+        t2 = P.present(self.holder, self.verifier.public_key,
+                       {"session_id": "s-9", "policy": ["nationality", "age"]})
+        for k in ("M", "PK", "r", "delta"):
+            self.assertEqual(self.t[k], t2[k])
+        self.assertNotEqual(self.t["pkVP"], t2["pkVP"])
+
+    def test_verifier_can_simulate(self):
+        msgs = [bytes.fromhex(m) for m in self.t["M"]]
+        sim = P.verifier_simulate(self.verifier, self.ctx, msgs, P._pts(self.t["PK"]))
+        self.assertTrue(self.verify(sim))
+
+    def test_lent_credential_rejected(self):
+        bob = PrivateKey()
+        alice = PrivateKey()
+        cb = P.make_credential(self.issuer, bob.public_key, ATTRS, 5)
+        sb = P.issue_credential(self.issuer, cb)
+        cover = P.random_cover(8, self.wl, self.pool)
+        cover.holder_keys[0] = alice.public_key
+        lent = P.Holder(alice, cb, sb, self.issuer.public_key, cover)
+        with self.assertRaises(ValueError):
+            P.present(lent, self.verifier.public_key, self.ctx)
+        # Manual forgery attempts: prove with Bob's row (Alice's sk) or Alice's row (Bob's s).
+        bob_holder = P.Holder(bob, cb, sb, self.issuer.public_key, cover)
+        cl = bob_holder.candidate_list(self.ctx["policy"])
+        a_idx = [P._pb(k) for k in cl.holder_ring].index(P._pb(alice.public_key))
+        for idx in (cl.authentic_index, a_idx):
+            sk = P._priv_int(alice)
+            rho = P._random_scalar()
+            h = P._mul_g(rho)
+            pkvp = P._mul(h, sk)
+            stmt = P._statement(self.ctx, self.verifier.public_key, cl.messages,
+                                cl.issuer_ring, cl.r_vals, cl.deltas, h, pkvp)
+            proof = P.pres_prove(stmt, cl.deltas, cl.holder_ring, h, pkvp,
+                                 self.verifier.public_key, index=idx,
+                                 s=cl.s_authentic, sk=sk)
+            sd = P.sdvs_sign(sk, P._mul(self.verifier.public_key, rho), P._mu_bytes(stmt, proof))
+            t = {"context": self.ctx, "M": [m.hex() for m in cl.messages],
+                 "PK": [P._pb(k).hex() for k in cl.issuer_ring],
+                 "r": [hex(x) for x in cl.r_vals], "delta": [P._pb(d).hex() for d in cl.deltas],
+                 "h": P._pb(h).hex(), "pkVP": P._pb(pkvp).hex(), "pi": proof, "sdvs": sd}
+            self.assertFalse(self.verify(t))
 
 
 if __name__ == "__main__":

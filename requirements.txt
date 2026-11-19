@@ -1,4 +1,6 @@
 coincurve==21.0.0
-ecdsa==0.19.2
 numpy==2.0.2
 scikit-learn==1.6.1
+sd-jwt==0.10.4
+jwcrypto==1.6.1
+py_arkworks_bls12381==0.5.0
