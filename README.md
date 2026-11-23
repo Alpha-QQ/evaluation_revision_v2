@@ -1,51 +1,38 @@
 # Candidate-set credential presentation: evaluation code
 
-Version: v4.1 (2026-11-19). Python 3.12, secp256k1 (coincurve), SHA-256.
-Comparison schemes: SD-JWT (sd-jwt 0.10.4), BBS (BLS12-381-SHA-256, py_arkworks_bls12381 0.5.0), zk-SNARK (Groth16, snarkjs 0.7.5 on Node.js).
+Python 3.12, secp256k1 (coincurve), SHA-256.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `main.py` | Single entry point. Edit only the settings block at the top. |
-| `proposed.py` | Protocol: Schnorr issuance, URS rows, joint designated-verifier proof, SDVS, candidate lists, presentation, verification, verifier simulator. |
-| `test_proposed_protocol.py` | Unit tests (run automatically by `main.py`). |
-| `attack_checks.py` | Attack regression checks (lent credential, verifier simulation, labels, same-list and cross-list comparison). |
-| `saliency_analysis.py` | Decoy-saliency study (correlated population, three generators, two classifiers). |
-| `benchmark.py` | Latency, peak traced memory, and presentation size. |
-| `comparison.py` | Issuance, presentation, verification and size of SD-JWT, BBS and the zk-SNARK credential on the same 20-attribute credential. |
-| `bbs.py` | BBS signatures and proofs following the IRTF CFRG draft (ciphersuite BLS12-381-SHA-256). |
-| `test_bbs.py` | Checks `bbs.py` against all signature and proof test vectors of the draft (`fixtures/bbs`, from https://github.com/decentralized-identity/bbs-signature). |
-| `zk/` | zk-SNARK credential: circuit `circuit/disclose.circom`, compiled circuit and proving key in `build/`, benchmark script `bench.js`, `package.json`. |
-| `fill_paper.py` | Writes the numbers of `results/results.json` into the paper's `%% BEGIN AUTO` blocks. |
-
-All settings and results (parameters, means, standard deviations, confidence intervals, environment) are written to `results/results.json`.
+| `proposed.py` | Protocol: Schnorr issuance, URS conversion, SDVS, linkage proof, presentation, verification. |
+| `test_proposed_protocol.py` | Unit tests of the protocol. |
+| `benchmark_candidate_sizes.py` | Latency, peak traced memory, and artifact size for candidate-set sizes and disclosed attributes (recorded manuscript result: `results_for_paper_v2.json`). |
+| `saliency_analysis.py` | Decoy-saliency study (recorded result: `results/saliency_results.json`). |
+| `netbench.py` | End-to-end network evaluation of one presentation (see below). |
+| `protocol_adapter.py` | Connects `netbench.py` to `proposed.py`, using the credential and serialization of the benchmark. |
+| `test_netbench.py` | Unit tests of the network evaluation. |
 
 ## Run on Windows
 
-Install Node.js 22 LTS from https://nodejs.org first (only needed once). On the first run `main.py` installs the pinned Node packages into `zk/node_modules` by itself. Then, in this folder:
+In this folder:
 
 ```bat
-python -m pip install -r requirements.txt
 cmd /c start /affinity 0xFFF /wait /b python main.py
-python fill_paper.py results\results.json path\to\cas-dc-template.tex
 ```
 
-Before running, set `MACHINE_LABEL` in `main.py`. `PROFILE = "quick"` runs a smoke test in a few seconds; `PROFILE = "paper"` is the full run.
-Do not run other timing experiments at the same time.
+`main.py` switches to Python 3.12 if another version starts it (and installs Python 3.12 with winget if none is found), installs the packages in `requirements.txt` when they are missing, runs the unit tests, and then the enabled experiments. All settings and results are written to `results/results.json`.
 
-## Rebuilding the zk-SNARK circuit (optional)
+`PROFILE = "quick"` runs a smoke test in about a minute; `PROFILE = "paper"` is the full run. `RUN_BENCHMARK` and `RUN_SALIENCY` rerun the original benchmark and saliency study and are off by default. Do not run other timing experiments at the same time.
 
-`zk/build/` already contains the compiled circuit (`disclose_js/disclose.wasm`), the Groth16 proving key (`disclose.zkey`) and the verification key (`vkey.json`), so circom is not needed to run the benchmark. They were produced with circom 2.2.2 and snarkjs 0.7.5:
+## Network evaluation
 
-```sh
-circom circuit/disclose.circom --r1cs --wasm -l node_modules -o build
-npx snarkjs powersoftau new bn128 14 build/pot0.ptau
-npx snarkjs powersoftau contribute build/pot0.ptau build/pot1.ptau -e="<entropy>"
-npx snarkjs powersoftau prepare phase2 build/pot1.ptau build/pot14.ptau
-npx snarkjs groth16 setup build/disclose.r1cs build/pot14.ptau build/d0.zkey
-npx snarkjs zkey contribute build/d0.zkey build/disclose.zkey -e="<entropy>"
-npx snarkjs zkey export verificationkey build/disclose.zkey build/vkey.json
-```
+Everything runs on the local machine. A verifier service and a verifiable data registry (VDR) run as HTTP/1.1 servers on 127.0.0.1. The VDR serves a did:web document for each issuer and one Bitstring Status List (131072 entries, 1% revoked) per issuer. The holder and the verifier reach the servers through clients whose traffic is shaped in software:
 
-The single-party setup is adequate for benchmarking only.
+- a new connection costs two round-trip times (TCP and a TLS 1.3 handshake, without the TLS cryptography);
+- each request and each response is delayed by half the round-trip time;
+- request and response bodies are paced to the link bandwidth, and all connections of one host share its uplink and downlink.
+
+One run measures, from the holder's side: reading and decrypting the credential from the wallet (AES-GCM file), fetching the verifier's request, resolving the issuer DIDs of the candidate list and checking their status entries, generating the presentation, and submitting it; the verifier fetches the status lists of all candidates and verifies the presentation before it answers. In the `cold` scenario nothing is cached; in the `warm` scenario both parties use cached DID documents and status lists. The grid covers candidate-set sizes, bandwidths, round-trip times, and both scenarios, in shuffled order.

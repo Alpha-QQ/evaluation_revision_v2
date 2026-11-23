@@ -1,129 +1,234 @@
 #!/usr/bin/env python3
-"""Decoy-saliency study.
-
-Genuine credentials follow a correlated population: a latent class z is drawn
-first, then every undisclosed field is drawn from a class-specific Zipf-like
-distribution.  Three holder-side decoy generators are compared:
-
-  uniform   every field uniform over its domain (ignores the population)
-  marginal  every field drawn independently from the population marginal
-            (what a holder can do with published per-field statistics)
-  joint     decoys drawn from the full population model (requires knowledge
-            of the joint distribution; upper bound on achievable quality)
-
-Two classifiers score candidates: logistic regression on one-hot features
-(no interactions) and histogram gradient boosting on categorical features
-(captures field interactions).  The prediction for a list is the candidate
-with the highest score; accuracy is compared with 1/n.
-"""
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import time
+from pathlib import Path
 from statistics import NormalDist
-from typing import Dict, List
 
 import numpy as np
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import OneHotEncoder
 
-GENERATORS = ("uniform", "marginal", "joint")
-CLASSIFIERS = ("logistic", "boosting")
+
+def parse_ints(value: str) -> list[int]:
+    return [int(item) for item in value.split(",") if item.strip()]
 
 
-def wilson(hits: int, total: int):
+def wilson_interval(hits: int, total: int) -> tuple[float, float]:
     z = NormalDist().inv_cdf(0.975)
-    p = hits / total
-    den = 1 + z * z / total
-    c = (p + z * z / (2 * total)) / den
-    half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / den
-    return c - half, c + half
+    observed = hits / total
+    denominator = 1 + z * z / total
+    center = (observed + z * z / (2 * total)) / denominator
+    half = (
+        z
+        * math.sqrt(
+            observed * (1 - observed) / total
+            + z * z / (4 * total * total)
+        )
+        / denominator
+    )
+    return center - half, center + half
 
 
-class Population:
-    def __init__(self, rng, fields, domain, classes, zipf):
-        ranks = np.arange(1, domain + 1, dtype=float) ** (-zipf)
-        base = ranks / ranks.sum()
-        self.weights = rng.dirichlet(np.full(classes, 2.0))
-        self.cond = np.empty((classes, fields, domain))
-        for k in range(classes):
-            for f in range(fields):
-                self.cond[k, f] = base[rng.permutation(domain)]
-        self.marginal = np.einsum("k,kfd->fd", self.weights, self.cond)
-        self.fields, self.domain = fields, domain
-
-    def sample_joint(self, rng, count):
-        z = rng.choice(len(self.weights), size=count, p=self.weights)
-        u = rng.random((count, self.fields, 1))
-        cdf = np.cumsum(self.cond[z], axis=2)
-        return (u > cdf).sum(axis=2).clip(max=self.domain - 1).astype(np.int16)
-
-    def sample_marginal(self, rng, count):
-        u = rng.random((count, self.fields, 1))
-        cdf = np.cumsum(self.marginal, axis=1)[None, :, :]
-        return (u > cdf).sum(axis=2).clip(max=self.domain - 1).astype(np.int16)
-
-    def sample_uniform(self, rng, count):
-        return rng.integers(self.domain, size=(count, self.fields), dtype=np.int16)
+def zipf_probabilities(domain_size: int, exponent: float) -> np.ndarray:
+    ranks = np.arange(1, domain_size + 1, dtype=float)
+    probabilities = ranks ** (-exponent)
+    return probabilities / probabilities.sum()
 
 
-def make_lists(rng, pop, lists, n, generator):
-    sampler = {"uniform": pop.sample_uniform, "marginal": pop.sample_marginal,
-               "joint": pop.sample_joint}[generator]
-    cand = sampler(rng, lists * n).reshape(lists, n, pop.fields)
-    j = rng.integers(n, size=lists)
-    cand[np.arange(lists), j] = pop.sample_joint(rng, lists)
-    labels = np.zeros((lists, n), dtype=np.int8)
-    labels[np.arange(lists), j] = 1
-    return cand.reshape(-1, pop.fields), labels.ravel(), j
+def make_lists(
+    rng: np.random.Generator,
+    list_count: int,
+    candidate_size: int,
+    field_count: int,
+    genuine_probabilities: np.ndarray,
+    decoy_source: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    domain_size = len(genuine_probabilities)
+    if decoy_source == "uniform":
+        candidates = rng.integers(
+            domain_size,
+            size=(list_count, candidate_size, field_count),
+            dtype=np.int16,
+        )
+    elif decoy_source == "matched":
+        candidates = rng.choice(
+            domain_size,
+            size=(list_count, candidate_size, field_count),
+            p=genuine_probabilities,
+        ).astype(np.int16)
+    else:
+        raise ValueError("decoy_source must be uniform or matched")
+
+    authentic_indices = rng.integers(candidate_size, size=list_count)
+    candidates[np.arange(list_count), authentic_indices] = rng.choice(
+        domain_size,
+        size=(list_count, field_count),
+        p=genuine_probabilities,
+    )
+    labels = np.zeros((list_count, candidate_size), dtype=np.int8)
+    labels[np.arange(list_count), authentic_indices] = 1
+    return (
+        candidates.reshape(-1, field_count),
+        labels.ravel(),
+        authentic_indices,
+    )
 
 
-def _model(kind, seed, domain, fields):
-    if kind == "logistic":
-        enc = OneHotEncoder(categories=[np.arange(domain)] * fields,
-                            handle_unknown="ignore", sparse_output=True)
-        clf = LogisticRegression(C=1.0, class_weight="balanced", max_iter=2000,
-                                 random_state=seed, solver="lbfgs")
-        return enc, clf
-    clf = HistGradientBoostingClassifier(categorical_features=list(range(fields)),
-                                         max_iter=200, learning_rate=0.1,
-                                         class_weight="balanced", random_state=seed)
-    return None, clf
+def choose_top_scores(
+    rng: np.random.Generator, scores: np.ndarray
+) -> np.ndarray:
+    guesses = np.empty(scores.shape[0], dtype=int)
+    for row_index, row in enumerate(scores):
+        tied = np.flatnonzero(row == row.max())
+        guesses[row_index] = rng.choice(tied)
+    return guesses
 
 
-def run_saliency(candidate_sizes: List[int], train_lists=600, test_lists=2000,
-                 fields=19, domain=8, classes=4, zipf=1.4, seed=20261119) -> Dict:
-    pop = Population(np.random.default_rng(seed), fields, domain, classes, zipf)
+def run_saliency(
+    candidate_sizes: list[int],
+    train_lists: int = 600,
+    test_lists: int = 2_000,
+    field_count: int = 19,
+    domain_size: int = 8,
+    zipf_exponent: float = 1.4,
+    seed: int = 20260731,
+) -> dict:
+    if not candidate_sizes or min(candidate_sizes) < 2:
+        raise ValueError("candidate sizes must be at least 2")
+    if min(train_lists, test_lists, field_count, domain_size) < 1:
+        raise ValueError("list, field, and domain sizes must be positive")
+
+    probabilities = zipf_probabilities(domain_size, zipf_exponent)
     rows = []
-    for n in candidate_sizes:
-        for gi, gen in enumerate(GENERATORS):
-            for ci, kind in enumerate(CLASSIFIERS):
-                s = seed + 1000 * n + 10 * gi + ci
-                rng = np.random.default_rng(s)
-                xtr, ytr, _ = make_lists(rng, pop, train_lists, n, gen)
-                enc, clf = _model(kind, s, domain, fields)
-                clf.fit(enc.fit_transform(xtr) if enc else xtr, ytr)
-                xte, _, j = make_lists(rng, pop, test_lists, n, gen)
-                score = clf.predict_proba(enc.transform(xte) if enc else xte)[:, 1]
-                score = score.reshape(test_lists, n)
-                guess = np.array([rng.choice(np.flatnonzero(r == r.max())) for r in score])
-                hits = int((guess == j).sum())
-                lo, hi = wilson(hits, test_lists)
-                rows.append({"generator": gen, "classifier": kind, "candidate_size": n,
-                             "hits": hits, "top1_accuracy": hits / test_lists,
-                             "baseline": 1 / n, "delta_clf": hits / test_lists - 1 / n,
-                             "accuracy_ci95_low": lo, "accuracy_ci95_high": hi,
-                             "delta_ci95_low": lo - 1 / n, "delta_ci95_high": hi - 1 / n,
-                             "seed": s})
-    return {"parameters": {"candidate_sizes": candidate_sizes, "train_lists": train_lists,
-                           "test_lists": test_lists, "undisclosed_fields": fields,
-                           "domain_size": domain, "latent_classes": classes,
-                           "zipf_exponent": zipf, "seed": seed,
-                           "generators": list(GENERATORS), "classifiers": list(CLASSIFIERS),
-                           "confidence_interval": "95% Wilson score interval"},
-            "summary": rows}
+    for candidate_size in candidate_sizes:
+        for source_index, source in enumerate(("uniform", "matched")):
+            run_seed = seed + candidate_size * 10 + source_index
+            rng = np.random.default_rng(run_seed)
+            train_x, train_y, _ = make_lists(
+                rng,
+                train_lists,
+                candidate_size,
+                field_count,
+                probabilities,
+                source,
+            )
+            encoder = OneHotEncoder(
+                categories=[np.arange(domain_size)] * field_count,
+                handle_unknown="ignore",
+                sparse_output=True,
+            )
+            encoded_train = encoder.fit_transform(train_x)
+            model = LogisticRegression(
+                C=1.0,
+                class_weight="balanced",
+                max_iter=2_000,
+                random_state=run_seed,
+                solver="lbfgs",
+            )
+            started = time.perf_counter()
+            model.fit(encoded_train, train_y)
+            fit_seconds = time.perf_counter() - started
+
+            test_x, _, authentic_indices = make_lists(
+                rng,
+                test_lists,
+                candidate_size,
+                field_count,
+                probabilities,
+                source,
+            )
+            started = time.perf_counter()
+            scores = model.predict_proba(
+                encoder.transform(test_x)
+            )[:, 1].reshape(test_lists, candidate_size)
+            guesses = choose_top_scores(rng, scores)
+            score_seconds = time.perf_counter() - started
+            hits = int(np.count_nonzero(guesses == authentic_indices))
+            accuracy = hits / test_lists
+            baseline = 1 / candidate_size
+            ci_low, ci_high = wilson_interval(hits, test_lists)
+            rows.append({
+                "decoy_source": source,
+                "candidate_size": candidate_size,
+                "train_lists": train_lists,
+                "test_lists": test_lists,
+                "hits": hits,
+                "top1_accuracy": accuracy,
+                "baseline": baseline,
+                "delta_clf": accuracy - baseline,
+                "advantage_point_estimate": max(0.0, accuracy - baseline),
+                "accuracy_ci95_low": ci_low,
+                "accuracy_ci95_high": ci_high,
+                "delta_ci95_low": ci_low - baseline,
+                "delta_ci95_high": ci_high - baseline,
+                "fit_seconds": fit_seconds,
+                "score_seconds": score_seconds,
+                "model_iterations": int(model.n_iter_[0]),
+                "seed": run_seed,
+            })
+
+    return {
+        "parameters": {
+            "candidate_sizes": candidate_sizes,
+            "train_lists": train_lists,
+            "test_lists": test_lists,
+            "disclosed_fields": 1,
+            "undisclosed_fields": field_count,
+            "domain_size": domain_size,
+            "genuine_distribution": "independent Zipf-like marginals",
+            "zipf_exponent": zipf_exponent,
+            "decoy_sources": ["uniform", "matched"],
+            "feature_encoding": "per-field categorical one-hot",
+            "classifier": "scikit-learn LogisticRegression",
+            "classifier_parameters": {
+                "C": 1.0,
+                "class_weight": "balanced",
+                "max_iter": 2_000,
+                "solver": "lbfgs",
+            },
+            "confidence_interval": "95% Wilson score interval",
+            "seed": seed,
+        },
+        "summary": rows,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Classifier-based candidate-saliency experiment."
+    )
+    parser.add_argument(
+        "--candidate-sizes", type=parse_ints, default=[50, 100, 200, 500]
+    )
+    parser.add_argument("--train-lists", type=int, default=600)
+    parser.add_argument("--test-lists", type=int, default=2_000)
+    parser.add_argument("--field-count", type=int, default=19)
+    parser.add_argument("--domain-size", type=int, default=8)
+    parser.add_argument("--zipf-exponent", type=float, default=1.4)
+    parser.add_argument("--seed", type=int, default=20260731)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("results/saliency_results.json"),
+    )
+    args = parser.parse_args()
+    results = run_saliency(
+        args.candidate_sizes,
+        args.train_lists,
+        args.test_lists,
+        args.field_count,
+        args.domain_size,
+        args.zipf_exponent,
+        args.seed,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    print(f"Wrote {args.output}")
 
 
 if __name__ == "__main__":
-    import json
-    print(json.dumps(run_saliency([50], 100, 200), indent=1)[:2000])
+    main()

@@ -7,124 +7,240 @@ All settings and results are written to results/results.json.
 """
 # ============================ settings ============================
 PROFILE = "paper"            # "paper" (full run) or "quick" (smoke test)
-MACHINE_LABEL = "Intel Core i7-12700H laptop, 16 GB, Windows 11 Home 25H2"
+MACHINE_LABEL = None         # None: read CPU, memory and OS from this machine
 
 PROFILES = {
-    "paper": dict(candidate_sizes=[50, 100, 200, 500], attribute_counts=list(range(1, 21)),
-                  fixed_n=100, fixed_d=20, latency_reps=100, memory_reps=20,
-                  saliency_sizes=[50, 100, 200, 500], train_lists=600, test_lists=2000,
-                  comparison_counts=[1, 5, 10, 15, 20], comparison_reps=100,
-                  comparison_memory_reps=20, zk_reps=30),
-    "quick": dict(candidate_sizes=[50, 100], attribute_counts=[1, 10, 20],
-                  fixed_n=50, fixed_d=20, latency_reps=3, memory_reps=1,
-                  saliency_sizes=[50], train_lists=100, test_lists=200,
-                  comparison_counts=[1, 20], comparison_reps=3,
-                  comparison_memory_reps=1, zk_reps=2),
+    "paper": dict(network=dict(candidate_sizes=[50, 100, 200, 500], bandwidths_mbps=[10, 100],
+                               rtts_ms=[20, 100], cache=["cold", "warm"], reps=10),
+                  benchmark=dict(candidate_sizes=[50, 100, 200, 500],
+                                 attribute_counts=list(range(1, 21)), repeats=100),
+                  saliency=dict(candidate_sizes=[50, 100, 200, 500])),
+    "quick": dict(network=dict(candidate_sizes=[10, 50], bandwidths_mbps=[100],
+                               rtts_ms=[20], cache=["cold", "warm"], reps=2),
+                  benchmark=dict(candidate_sizes=[50], attribute_counts=[1, 20], repeats=2),
+                  saliency=dict(candidate_sizes=[50])),
 }
-WHITELISTED_ISSUERS = 20     # size of the verifier whitelist used by the cover sets
-HOLDER_POOL = 1000           # public holder DIDs available as cover identities
-SEED = 20261119
+NETWORK = dict(handshake_rtts=2,          # new connection: TCP + TLS 1.3 handshake
+               parallel_connections=8,    # connections used to fetch DID documents / status lists
+               revoked_fraction=0.01,     # revoked entries in each issuer's status list
+               disclosed_attributes=20)   # disclosed fields (as in Table 1)
+RUN_NETWORK = True           # end-to-end network evaluation (new)
+RUN_BENCHMARK = False        # rerun the performance benchmark of the paper (Table 1, figures)
+RUN_SALIENCY = False         # rerun the decoy-saliency study of the paper
+SEED = 20261123
 OUTPUT = "results/results.json"
 # ==================================================================
 
+import os
+import sys
+
+SUPPORTED = ((3, 12), (3, 13), (3, 11))    # the pinned packages have wheels for these
+
+
+def _find_python():
+    """Path of an installed Python 3.12 (else 3.13, 3.11), or None."""
+    import glob
+    import shutil
+    import subprocess
+
+    def works(cmd, ver):
+        try:
+            r = subprocess.run(cmd + ["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                               capture_output=True, text=True, timeout=60)
+            return r.returncode == 0 and r.stdout.strip() == "%d.%d" % ver
+        except Exception:
+            return False
+
+    launcher = shutil.which("py")
+    local = os.environ.get("LOCALAPPDATA", "")
+    for ver in SUPPORTED:
+        tag = "%d%d" % ver
+        if launcher and works([launcher, "-%d.%d" % ver], ver):
+            return [launcher, "-%d.%d" % ver]
+        candidates = [os.path.join(local, "Programs", "Python", "Python" + tag, "python.exe"),
+                      os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                                   "Python" + tag, "python.exe"),
+                      r"C:\Python" + tag + r"\python.exe",
+                      os.path.join(local, "Microsoft", "WindowsApps", "python%d.%d.exe" % ver)]
+        candidates += glob.glob(os.path.join(local, "Programs", "Python", "Python" + tag + "*", "python.exe"))
+        found = shutil.which("python%d.%d" % ver)
+        if found:
+            candidates.append(found)
+        for c in candidates:
+            if c and os.path.isfile(c) and works([c], ver):
+                return [c]
+    return None
+
+
+def _ensure_python():
+    """Rerun this script with Python 3.12 (else 3.13 or 3.11) if started with
+    another version; install Python 3.12 with winget if none is found."""
+    if sys.version_info[:2] in SUPPORTED:
+        return
+    import shutil
+    import subprocess
+    here = sys.version_info[:2]
+    if os.environ.get("DIDVC_RELAUNCHED"):
+        sys.exit("The selected Python is %d.%d, not 3.12; install Python 3.12 and run again." % here)
+    cmd = _find_python()
+    if cmd is None and shutil.which("winget"):
+        print("No Python 3.12 found (this is Python %d.%d); installing Python 3.12 for this user "
+              "with winget ..." % here, flush=True)
+        subprocess.call(["winget", "install", "-e", "--id", "Python.Python.3.12", "--scope", "user",
+                         "--accept-package-agreements", "--accept-source-agreements"])
+        cmd = _find_python()
+    if cmd is None:
+        sys.exit("Python 3.12 is required, but this is Python %d.%d and no Python 3.12 was found. "
+                 "Install Python 3.12 from https://www.python.org/downloads/windows/ and run again." % here)
+    print("Using %s for this run (this Python is %d.%d)." % (" ".join(cmd), here[0], here[1]), flush=True)
+    env = dict(os.environ, DIDVC_RELAUNCHED="1")
+    sys.exit(subprocess.call(cmd + sys.argv, env=env))
+
+
+if __name__ == "__main__":
+    _ensure_python()
+
 import importlib
 import json
-import os
 import platform
-import sys
+import subprocess
 import time
 import unittest
 
-REQUIRED = {"coincurve": "21.0.0", "numpy": None, "sklearn": None, "sd_jwt": None,
-            "jwcrypto": None, "py_arkworks_bls12381": None}
+HERE = os.path.dirname(os.path.abspath(__file__))
+REQUIRED = ["coincurve", "ecdsa", "numpy", "sklearn", "cryptography"]
 
 
-def _check_packages():
-    missing = []
+def _missing():
+    out = []
     for name in REQUIRED:
         try:
             importlib.import_module(name)
         except ImportError:
-            missing.append(name)
+            out.append(name)
+    return out
+
+
+def _check_packages():
+    missing = _missing()
+    if missing:
+        print("installing missing packages (%s) from requirements.txt ..." % ", ".join(missing))
+        subprocess.call([sys.executable, "-m", "pip", "install", "-r",
+                         os.path.join(HERE, "requirements.txt")])
+        importlib.invalidate_caches()
+        missing = _missing()
     if missing:
         sys.exit("Missing packages: %s. Run: python -m pip install -r requirements.txt"
                  % ", ".join(missing))
-    import shutil
-    here = os.path.dirname(os.path.abspath(__file__))
-    if shutil.which("node") is None:
-        sys.exit("Node.js not found (needed for the zk-SNARK comparison). Install Node.js 22 LTS.")
-    zk = os.path.join(here, "zk")
-    if not os.path.isdir(os.path.join(zk, "node_modules", "snarkjs")):
-        # Install the pinned Node packages automatically (bypasses the
-        # PowerShell script policy that can block npm.ps1 on Windows).
-        npm = shutil.which("npm.cmd") or shutil.which("npm")
-        if npm is None:
-            sys.exit("npm not found. Reinstall Node.js 22 LTS with the default options.")
-        print("installing snarkjs and circomlibjs into zk/node_modules (one time) ...")
-        import subprocess
-        if subprocess.run([npm, "ci", "--no-audit", "--no-fund"], cwd=zk).returncode != 0:
-            sys.exit("npm ci failed; see the messages above")
-        if not os.path.isdir(os.path.join(zk, "node_modules", "snarkjs")):
-            sys.exit("snarkjs still missing after npm ci")
+
+
+def _cpu_name():
+    try:
+        if platform.system() == "Windows":
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                 r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            return winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+        if os.path.exists("/proc/cpuinfo"):
+            for line in open("/proc/cpuinfo", encoding="utf-8", errors="ignore"):
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or "unknown CPU"
+
+
+def _memory_gb():
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                            ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
+                            ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong),
+                            ("ae", ctypes.c_ulonglong)]
+            m = MS()
+            m.len = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return round(m.total / 2 ** 30)
+        return round(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2 ** 30)
+    except Exception:
+        return None
+
+
+def _machine():
+    cpu, mem = _cpu_name(), _memory_gb()
+    if platform.system() == "Windows":
+        osname = "Windows %s (build %s)" % (platform.release(), platform.version())
+    else:
+        osname = platform.platform()
+    auto = ", ".join(x for x in (cpu, "%d GB" % mem if mem else None, osname) if x)
+    return {"cpu": cpu, "memory_gb": mem, "os": osname, "logical_cpus": os.cpu_count(),
+            "label": MACHINE_LABEL or auto}
 
 
 def _versions():
     from importlib.metadata import version
-    return {p: version(p) for p in ("coincurve", "numpy", "scikit-learn", "sd-jwt",
-                                    "jwcrypto", "py_arkworks_bls12381")}
+    return {p: version(p) for p in ("coincurve", "ecdsa", "numpy", "scikit-learn", "cryptography")}
+
+
+def _run_script(args, result_path):
+    """Run one of the original evaluation scripts and return its JSON output."""
+    if subprocess.call([sys.executable, os.path.join(HERE, args[0])] + args[1:], cwd=HERE) != 0:
+        sys.exit("%s failed" % args[0])
+    with open(result_path, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def main():
     _check_packages()
-    import attack_checks
-    import benchmark
-    import comparison
-    import saliency_analysis
+    os.chdir(HERE)
+    sys.path.insert(0, HERE)
     cfg = PROFILES[PROFILE]
     started = time.time()
+    out = {"profile": PROFILE, "machine": _machine(),
+           "environment": {"python": sys.version, "platform": platform.platform(),
+                           "packages": _versions(), "curve": "secp256k1", "hash": "SHA-256"},
+           "settings": {"profile": cfg, "network": NETWORK, "seed": SEED,
+                        "run_network": RUN_NETWORK, "run_benchmark": RUN_BENCHMARK,
+                        "run_saliency": RUN_SALIENCY}}
 
-    print("[1/5] unit tests (proposed protocol, BBS draft test vectors)")
-    suite = unittest.defaultTestLoader.loadTestsFromNames(["test_proposed_protocol", "test_bbs"])
+    print("[1] unit tests")
+    suite = unittest.defaultTestLoader.loadTestsFromNames(["test_proposed_protocol", "test_netbench"])
     res = unittest.TextTestRunner(verbosity=0).run(suite)
     if not res.wasSuccessful():
         sys.exit("unit tests failed; stopping")
+    out["unit_tests_run"] = res.testsRun
 
-    print("[2/5] attack regression checks")
-    attacks = attack_checks.run(10)
-    print("  ", attacks)
-    if attacks["A4_lent_credential_accepted"] or not attacks["honest_transcripts_accepted"]:
-        sys.exit("attack checks failed; stopping")
+    if RUN_NETWORK:
+        import netbench
+        print("[2] end-to-end network evaluation")
+        out["network"] = netbench.run_network(dict(cfg["network"], **NETWORK), SEED,
+                                              log=lambda s: print(s, flush=True))
 
-    print("[3/5] decoy-saliency study")
-    saliency = saliency_analysis.run_saliency(cfg["saliency_sizes"], cfg["train_lists"],
-                                              cfg["test_lists"], seed=SEED)
+    tmp = os.path.join(HERE, "results", "_original_scripts")
+    if RUN_BENCHMARK:
+        b = cfg["benchmark"]
+        print("[3] performance benchmark (benchmark_candidate_sizes.py)")
+        out["benchmark"] = _run_script(
+            ["benchmark_candidate_sizes.py",
+             "--candidate-sizes", ",".join(map(str, b["candidate_sizes"])),
+             "--attribute-counts", ",".join(map(str, b["attribute_counts"])),
+             "--repeats", str(b["repeats"]), "--output-dir", tmp],
+            os.path.join(tmp, "results_for_paper.json"))
+    if RUN_SALIENCY:
+        s = cfg["saliency"]
+        print("[4] decoy-saliency study (saliency_analysis.py)")
+        out["saliency"] = _run_script(
+            ["saliency_analysis.py", "--candidate-sizes", ",".join(map(str, s["candidate_sizes"])),
+             "--output", os.path.join(tmp, "saliency_results.json")],
+            os.path.join(tmp, "saliency_results.json"))
 
-    print("[4/5] performance benchmark")
-    perf = benchmark.run_benchmark(cfg["candidate_sizes"], cfg["attribute_counts"],
-                                   cfg["fixed_n"], cfg["fixed_d"], cfg["latency_reps"],
-                                   cfg["memory_reps"], WHITELISTED_ISSUERS, HOLDER_POOL, SEED)
-
-    print("[5/5] comparison with SD-JWT, BBS and zk-SNARK")
-    comp = comparison.run_comparison(cfg["comparison_counts"], cfg["comparison_reps"],
-                                     cfg["comparison_memory_reps"], cfg["zk_reps"], SEED)
-
-    out = {
-        "profile": PROFILE,
-        "machine_label": MACHINE_LABEL,
-        "environment": {"python": sys.version, "platform": platform.platform(),
-                        "processor": platform.processor(), "packages": _versions(),
-                        "curve": "secp256k1", "hash": "SHA-256"},
-        "settings": {"profile": cfg, "whitelisted_issuers": WHITELISTED_ISSUERS,
-                     "holder_pool": HOLDER_POOL, "seed": SEED},
-        "unit_tests_run": res.testsRun,
-        "attack_checks": attacks,
-        "saliency": saliency,
-        "performance": perf,
-        "comparison": comp,
-        "elapsed_seconds": round(time.time() - started, 1),
-    }
-    os.makedirs(os.path.dirname(OUTPUT), exist_ok=True)
-    with open(OUTPUT, "w", encoding="utf-8") as fh:
+    out["elapsed_seconds"] = round(time.time() - started, 1)
+    os.makedirs(os.path.dirname(os.path.join(HERE, OUTPUT)), exist_ok=True)
+    with open(os.path.join(HERE, OUTPUT), "w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=1)
     print("wrote", OUTPUT, "in", out["elapsed_seconds"], "s")
 
