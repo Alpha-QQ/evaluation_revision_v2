@@ -8,6 +8,7 @@ from proposed import (
     issue_credential,
     sign_urs_dvs,
     simulate_sdvs,
+    status_entry,
     verify_urs_dvs,
 )
 
@@ -47,11 +48,9 @@ class ProposedProtocolTests(unittest.TestCase):
             "holder_public_key": self.holder_sk.public_key.format(
                 compressed=True
             ).hex(),
-            "credential_status": {
-                "entry": "issuer-status-17",
-                "state": "ok",
-                "source": "issuer",
-            },
+            "credential_status": status_entry(
+                self.issuer_sk.public_key.format(compressed=True).hex(), 17
+            ),
         }
         issuer_signature = issue_credential(self.issuer_sk, self.authentic)
         self.issuer_ring = [
@@ -149,6 +148,35 @@ class ProposedProtocolTests(unittest.TestCase):
         self.assertEqual(
             genuine["credential_status"],
             self.authentic["credential_status"],
+        )
+
+    def test_decoys_carry_no_marker(self):
+        messages = [
+            json.loads(bytes.fromhex(value))
+            for value in self.bundle["vp"]["mu"]["M"]
+        ]
+        statuses = [message["credential_status"] for message in messages]
+        self.assertTrue(all(set(st) == set(statuses[0]) for st in statuses))
+        text = json.dumps(messages).lower()
+        for marker in ("decoy", "mask", "authentic", "genuine"):
+            self.assertNotIn(marker, text)
+
+    def test_revoked_status_rejected(self):
+        self.assertEqual(
+            verify_urs_dvs(
+                self.bundle, self.verifier_sk, self.issuer_ring,
+                expected_context=self.context, expected_schema=self.schema,
+                status_check=lambda issuer, index: True,
+            ),
+            (True, True),
+        )
+        genuine_issuer = self.authentic["issuer_public_key"]
+        self.assertFalse(
+            verify_urs_dvs(
+                self.bundle, self.verifier_sk, self.issuer_ring,
+                expected_context=self.context, expected_schema=self.schema,
+                status_check=lambda issuer, index: issuer != genuine_issuer,
+            )[0]
         )
 
     def test_unexpected_schema_rejected(self):

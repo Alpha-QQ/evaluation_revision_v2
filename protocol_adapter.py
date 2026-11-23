@@ -12,9 +12,10 @@ import secrets
 from coincurve import PrivateKey, PublicKey
 
 from benchmark_candidate_sizes import USER, serialize_artifact
-from proposed import issue_credential, sign_urs_dvs, verify_urs_dvs
+from proposed import issue_credential, sign_urs_dvs, status_entry, verify_urs_dvs
 
 ATTRIBUTES = list(USER)
+GENUINE_STATUS_INDEX = 1234
 
 
 def pub_xy(pub: PublicKey) -> tuple[bytes, bytes]:
@@ -32,7 +33,8 @@ def make_setup(n_max: int, seed: int) -> dict:
         **USER,
         "issuer_public_key": issuer.public_key.format(compressed=True).hex(),
         "holder_public_key": holder.public_key.format(compressed=True).hex(),
-        "credential_status": {"entry": "authentic", "state": "ok", "source": "issuer"},
+        "credential_status": status_entry(issuer.public_key.format(compressed=True).hex(),
+                                          GENUINE_STATUS_INDEX),
     }
     signature = issue_credential(issuer, credential)
     return {
@@ -52,7 +54,7 @@ def new_context(disclosed: int) -> dict:
     return {"session_id": secrets.token_hex(16), "policy": sorted(ATTRIBUTES[:disclosed])}
 
 
-def present(setup: dict, record: dict, ctx: dict, n: int) -> bytes:
+def present(setup: dict, record: dict, ctx: dict, n: int, decoy_status_index=None) -> bytes:
     bundle = sign_urs_dvs(
         PrivateKey(bytes.fromhex(record["holder_sk"])),
         setup["ring"][:n - 1],
@@ -63,11 +65,13 @@ def present(setup: dict, record: dict, ctx: dict, n: int) -> bytes:
         reveal_keys=list(ctx["policy"]),
         ring_size=n,
         context=ctx,
+        decoy_status_index=decoy_status_index,
     )
     return serialize_artifact(bundle)
 
 
-def verify(setup: dict, body: bytes, ctx: dict, n: int) -> bool:
+def verify(setup: dict, body: bytes, ctx: dict, n: int, status_check=None) -> bool:
     ok, _ = verify_urs_dvs(json.loads(body), setup["verifier_sk"], setup["issuer_pubs"][:n],
-                           expected_context=ctx, expected_schema=setup["schema"])
+                           expected_context=ctx, expected_schema=setup["schema"],
+                           status_check=status_check)
     return bool(ok)

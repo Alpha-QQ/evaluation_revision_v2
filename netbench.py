@@ -19,9 +19,10 @@ List per issuer.  A presentation consists of
   1. GET  /request        holder <- verifier   policy and session context
   2. POST /presentation   holder -> verifier   transcript T, verification result
 
-Before step 2 the holder resolves the issuer DIDs named in its candidate list
-and checks their status entries; when the verifier receives T it checks the
-status entries of all candidates.  In the "cold" scenario nothing is cached
+Before step 2 the holder resolves the issuer DIDs named in its candidate list,
+checks the status entry of its own credential, and gives every decoy an
+unrevoked entry of its issuer's status list; when the verifier receives T it
+checks the status entry that each candidate names.  In the "cold" scenario nothing is cached
 and every DID document and status list is fetched; in the "warm" scenario
 both parties use cached copies (e.g. refreshed periodically).
 """
@@ -128,11 +129,13 @@ class ShapedConnection(http.client.HTTPConnection):
 class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128   # the default of 5 drops simultaneous connections on Windows
 
 
 def _handler(routes_get: dict, post_handler=None):
     class H(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        disable_nagle_algorithm = True   # no delayed-ACK stalls between header and body writes
 
         def log_message(self, *a):
             pass
@@ -195,14 +198,19 @@ def did_document(did: str, pub_xy: tuple[bytes, bytes]) -> bytes:
     return json.dumps(doc, separators=(",", ":")).encode()
 
 
-def status_list(did: str, rng: random.Random, revoked_fraction: float) -> tuple[bytes, int]:
-    """Return a Bitstring Status List credential and one unrevoked index."""
+def status_list(did: str, rng: random.Random, revoked_fraction: float,
+                keep: int | None = None) -> tuple[bytes, int]:
+    """Return a Bitstring Status List credential and one unrevoked index
+    (`keep`, if given, is never revoked and is the index returned)."""
     bits = bytearray(STATUS_LIST_BITS // 8)
     revoked = set(rng.sample(range(STATUS_LIST_BITS), int(STATUS_LIST_BITS * revoked_fraction)))
+    if keep is not None:
+        revoked.discard(keep)
     for i in revoked:
         bits[i // 8] |= 0x80 >> (i % 8)
-    free = next(i for i in range(rng.randrange(STATUS_LIST_BITS), STATUS_LIST_BITS * 2)
-                if (i % STATUS_LIST_BITS) not in revoked) % STATUS_LIST_BITS
+    free = keep if keep is not None else next(
+        i for i in range(rng.randrange(STATUS_LIST_BITS), STATUS_LIST_BITS * 2)
+        if (i % STATUS_LIST_BITS) not in revoked) % STATUS_LIST_BITS
     encoded = base64.urlsafe_b64encode(gzip.compress(bytes(bits), mtime=0)).rstrip(b"=").decode()
     cred = {
         "@context": ["https://www.w3.org/ns/credentials/v2"],
@@ -218,6 +226,14 @@ def check_status(list_bytes: bytes, index: int) -> bool:
     enc = json.loads(list_bytes)["credentialSubject"]["encodedList"][1:]
     raw = gzip.decompress(base64.urlsafe_b64decode(enc + "=" * (-len(enc) % 4)))
     return not (raw[index // 8] & (0x80 >> (index % 8)))
+
+
+def pick_unrevoked(list_bytes: bytes, rng: random.Random) -> int:
+    """A uniformly random unrevoked index of a status list (holder side, for a decoy)."""
+    while True:
+        i = rng.randrange(STATUS_LIST_BITS)
+        if check_status(list_bytes, i):
+            return i
 
 
 def resolve_ok(doc_bytes: bytes, did: str, pub_xy: tuple[bytes, bytes]) -> bool:
@@ -255,12 +271,15 @@ class World:
         self.vdr = _start(_Server(("127.0.0.1", 0), _handler({})))
         self.vdr_port = self.vdr.server_address[1]
         self.dids, self.docs, self.lists, self.index = [], {}, {}, []
+        self.by_key = {}                      # issuer key (hex) -> issuer number
         routes = {}
         for i, pub in enumerate(self.issuers):
             did = did_web(self.vdr_port, i)
             xy = proto.pub_xy(pub)
             doc = did_document(did, xy)
-            lst, free = status_list(did, rng, revoked_fraction)
+            lst, free = status_list(did, rng, revoked_fraction,
+                                    keep=proto.GENUINE_STATUS_INDEX if i == 0 else None)
+            self.by_key[pub.format(compressed=True).hex()] = i
             routes[did_web_path(i)] = (lambda d=doc: d)
             routes[status_path(i)] = (lambda l=lst: l)
             self.dids.append(did)
@@ -310,12 +329,21 @@ def run_once(world: World, mbps: float, rtt_ms: float, cache: str, cfg: dict,
         else:
             fetched = {status_path(i): vcache[status_path(i)]() for i in range(n)}
         t1 = time.perf_counter()
-        ok_status = all(check_status(fetched[status_path(i)], world.index[i]) for i in range(n))
-        t2 = time.perf_counter()
-        ok = proto.verify(world.setup, body, session["ctx"], n)
+        spent = [0.0]
+
+        def status_check(issuer_hex, index):
+            # status entry of each candidate, as written in the transcript
+            s0 = time.perf_counter()
+            i = world.by_key.get(issuer_hex)
+            ok_i = i is not None and check_status(fetched[status_path(i)], index)
+            spent[0] += time.perf_counter() - s0
+            return ok_i
+
+        ok = proto.verify(world.setup, body, session["ctx"], n, status_check=status_check)
         t3 = time.perf_counter()
-        return json.dumps({"ok": bool(ok and ok_status), "fetch_ms": (t1 - t0) * 1e3,
-                           "status_ms": (t2 - t1) * 1e3, "verify_ms": (t3 - t2) * 1e3}).encode()
+        return json.dumps({"ok": bool(ok), "fetch_ms": (t1 - t0) * 1e3,
+                           "status_ms": spent[0] * 1e3,
+                           "verify_ms": (t3 - t1 - spent[0]) * 1e3}).encode()
 
     verifier = _start(_Server(("127.0.0.1", 0), _handler(
         {"/request": lambda: json.dumps(session["ctx"]).encode()}, on_post)))
@@ -330,7 +358,7 @@ def run_once(world: World, mbps: float, rtt_ms: float, cache: str, cfg: dict,
         ctx = json.loads(conn.request_shaped("GET", "/request"))
         request_bytes = conn.bytes_down
         t_req = time.perf_counter()
-        # holder-side resolution of the issuer DIDs and status checks
+        # holder-side resolution of the issuer DIDs and status lists
         if cache == "cold":
             paths = [did_web_path(i) for i in range(n)] + [status_path(i) for i in range(n)]
             fetched = _fetch_all(paths, world.vdr_port, holder_link, hs, conns)
@@ -340,10 +368,15 @@ def run_once(world: World, mbps: float, rtt_ms: float, cache: str, cfg: dict,
         t_fetch = time.perf_counter()
         ok_dids = all(resolve_ok(fetched[did_web_path(i)], world.dids[i],
                                  proto.pub_xy(world.issuers[i])) for i in range(n))
-        ok_stat = all(check_status(fetched[status_path(i)], world.index[i]) for i in range(n))
+        ok_stat = check_status(fetched[status_path(0)],
+                               cred["credential"]["credential_status"]["statusListIndex"])
         t_check = time.perf_counter()
-        # generation
-        transcript = proto.present(world.setup, cred, ctx, n)
+        # generation; each decoy gets an unrevoked entry of its issuer's list
+        pick_rng = random.Random()
+        transcript = proto.present(
+            world.setup, cred, ctx, n,
+            decoy_status_index=lambda key: pick_unrevoked(fetched[status_path(world.by_key[key])],
+                                                          pick_rng))
         t_gen = time.perf_counter()
         # 2. presentation and result
         result = json.loads(conn.request_shaped(

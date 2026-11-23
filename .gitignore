@@ -2,4 +2,4 @@ __pycache__/
 *.py[cod]
 .venv/
 results/smoke*.json
-results/_original_scripts/
+zk/node_modules/

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from coincurve import PrivateKey
 
-from proposed import issue_credential, sign_urs_dvs, verify_urs_dvs
+from proposed import issue_credential, sign_urs_dvs, status_entry, verify_urs_dvs
 
 
 USER = {
@@ -134,11 +134,9 @@ def main() -> None:
         "holder_public_key": holder_key.public_key.format(
             compressed=True
         ).hex(),
-        "credential_status": {
-            "entry": "authentic",
-            "state": "ok",
-            "source": "issuer",
-        },
+        "credential_status": status_entry(
+            issuer_key.public_key.format(compressed=True).hex(), 1234
+        ),
     }
     issuer_signature = issue_credential(issuer_key, authentic_credential)
     issuer_whitelist = [issuer_key.public_key, *issuer_ring_keys]

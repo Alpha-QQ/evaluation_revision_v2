@@ -1,0 +1,45 @@
+{
+  "python": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "curve": "secp256k1",
+  "hash": "SHA-256",
+  "urs": "Tso US(1,n) Schnorr conversion with cyclic witness-hiding proof",
+  "sdvs": "Saeednia-Kremer-Markowitch (r,s,t) construction",
+  "linkage_proof": "Fiat-Shamir Chaum-Pedersen Sigma-OR",
+  "serialization": "canonical compact JSON (UTF-8)",
+  "garbage_collection": "gc.collect() before each measured call",
+  "confidence_interval": "normal-approximation 95% CI",
+  "candidate_sizes": [
+    50,
+    100,
+    200,
+    500
+  ],
+  "attribute_counts": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "repeats": 100,
+  "packages": {
+    "coincurve": "21.0.0",
+    "ecdsa": "0.19.2"
+  }
+}

@@ -47,5 +47,44 @@ class NetbenchTests(unittest.TestCase):
         self.assertFalse(proto.verify(setup, body, other, 10))
 
 
+    def test_status_entries_checked_from_transcript(self):
+        setup = proto.make_setup(6, 2)
+        world = netbench.World(6, setup, 2, 0.5)
+        try:
+            lists = {i: world.routes[netbench.status_path(i)]() for i in range(6)}
+            rng = random.Random(3)
+            ctx = proto.new_context(5)
+            body = proto.present(setup, setup["credential_record"], ctx, 6,
+                                 decoy_status_index=lambda k: netbench.pick_unrevoked(
+                                     lists[world.by_key[k]], rng))
+            check = lambda k, idx: netbench.check_status(lists[world.by_key[k]], idx)
+            self.assertTrue(proto.verify(setup, body, ctx, 6, status_check=check))
+            # with uniform indexes, half of the list revoked, some decoy fails
+            results = [proto.verify(setup, proto.present(setup, setup["credential_record"], ctx, 6),
+                                    ctx, 6, status_check=check) for _ in range(5)]
+            self.assertIn(False, results)
+        finally:
+            world.vdr.shutdown()
+            world.vdr.server_close()
+
+
+    def test_fetch_time_follows_link_model(self):
+        # 32 small objects over 8 connections at RTT 20 ms: two handshake RTTs
+        # plus four request RTTs per connection, about 120 ms in total
+        routes = {"/o%d" % i: (lambda: b"x" * 500) for i in range(32)}
+        srv = netbench._start(netbench._Server(("127.0.0.1", 0), netbench._handler(routes)))
+        try:
+            link = netbench.Link(100, 20)
+            t = time.perf_counter()
+            out = netbench._fetch_all(list(routes), srv.server_address[1], link, 2, 8)
+            elapsed = time.perf_counter() - t
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(len(out), 32)
+        self.assertGreater(elapsed, 0.115)
+        self.assertLess(elapsed, 0.260)
+
+
 if __name__ == "__main__":
     unittest.main()

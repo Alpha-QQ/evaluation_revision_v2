@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from coincurve import PrivateKey, PublicKey
 
@@ -24,6 +24,36 @@ METADATA_FIELDS = {
     "holder_public_key",
     "credential_status",
 }
+STATUS_LIST_SIZE = 131072      # entries in each issuer's Bitstring Status List
+STATUS_FIELDS = {"statusPurpose", "statusListIndex"}
+# Value domains from which decoy string attributes are drawn.  A deployment
+# supplies its own domains through decoy_domains; the defaults cover the
+# string fields of the benchmark credential.
+DEFAULT_STRING_DOMAINS = {
+    "name": ["Alice", "Bruno", "Chen", "Daniel", "Elena", "Farah", "Grace", "Hiro",
+             "Ivan", "Julia", "Kevin", "Laura", "Mei", "Nora", "Omar", "Priya",
+             "Quentin", "Rosa", "Sam", "Tina", "Umar", "Vera", "Wei", "Yuki"],
+    "nationality": ["Taiwan", "Japan", "Korea", "Germany", "France", "Canada",
+                    "Brazil", "India", "Kenya", "Spain", "Italy", "Mexico"],
+}
+
+
+def status_entry(issuer_key_hex: str, index: int) -> Dict[str, Any]:
+    """Status entry of a credential: an index in the revocation Bitstring
+    Status List published by the credential's issuer (issuer_public_key)."""
+    return {"statusPurpose": "revocation", "statusListIndex": int(index)}
+
+
+def _status_well_formed(credential: Dict[str, Any]) -> bool:
+    status = credential.get("credential_status")
+    return (
+        isinstance(status, dict)
+        and set(status) == STATUS_FIELDS
+        and status["statusPurpose"] == "revocation"
+        and isinstance(status["statusListIndex"], int)
+        and not isinstance(status["statusListIndex"], bool)
+        and 0 <= status["statusListIndex"] < STATUS_LIST_SIZE
+    )
 
 
 def _to_pub(obj: Any) -> PublicKey:
@@ -509,12 +539,14 @@ def _credential(message: Union[bytes, str, Dict[str, Any]]) -> Dict[str, Any]:
     return value
 
 
-def _decoy_value(value: Any, candidate_index: int, field: str) -> Any:
+def _decoy_value(value: Any, field: str, domains: Dict[str, List[Any]]) -> Any:
+    if field in domains:
+        return SYSTEM_RANDOM.choice(domains[field])
     if isinstance(value, bool):
         return bool(SYSTEM_RANDOM.getrandbits(1))
     if isinstance(value, int):
         return SYSTEM_RANDOM.randint(0, 100)
-    return f"decoy-{candidate_index}-{field}"
+    raise ValueError("no decoy value domain for string field %r" % field)
 
 
 def _holder_ring_from_messages(messages: List[bytes]) -> List[PublicKey]:
@@ -538,7 +570,11 @@ def sign_urs_dvs(
     reveal_keys: Optional[List[str]] = None,
     ring_size: int = RING_SIZE,
     context: Dict[str, Any],
+    decoy_domains: Optional[Dict[str, List[Any]]] = None,
+    decoy_status_index: Optional[Callable[[str], int]] = None,
 ) -> Dict[str, Any]:
+    """decoy_status_index(issuer_key_hex) returns an unrevoked index in that
+    issuer's status list for a decoy; by default a uniform index is used."""
     if ring_size < 2:
         raise ValueError("ring_size must be at least 2")
 
@@ -570,8 +606,10 @@ def sign_urs_dvs(
         raise ValueError("credential issuer key does not match issuer_vk")
     if authentic["holder_public_key"] != _point_bytes(holder_vk).hex():
         raise ValueError("credential holder key does not match holder_sk")
-    if not isinstance(authentic["credential_status"], dict):
-        raise ValueError("credential_status must be an object")
+    if not _status_well_formed(authentic):
+        raise ValueError("credential_status must be a Bitstring Status List entry of the issuer")
+    domains = dict(DEFAULT_STRING_DOMAINS, **(decoy_domains or {}))
+    pick_index = decoy_status_index or (lambda _key: SYSTEM_RANDOM.randrange(STATUS_LIST_SIZE))
     attrs = {
         field: value
         for field, value in authentic.items()
@@ -583,23 +621,18 @@ def sign_urs_dvs(
     candidates = [authentic]
     for candidate_index in range(1, ring_size):
         decoy_holder = PrivateKey().public_key
+        decoy_issuer = _point_bytes(issuer_ring[candidate_index]).hex()
         candidates.append(
             {
                 **{
                     field: value
                     if field in disclosed
-                    else _decoy_value(value, candidate_index, field)
+                    else _decoy_value(value, field, domains)
                     for field, value in attrs.items()
                 },
-                "issuer_public_key": _point_bytes(
-                    issuer_ring[candidate_index]
-                ).hex(),
+                "issuer_public_key": decoy_issuer,
                 "holder_public_key": _point_bytes(decoy_holder).hex(),
-                "credential_status": {
-                    "entry": f"decoy-{candidate_index}",
-                    "state": "ok",
-                    "source": "holder-mask",
-                },
+                "credential_status": status_entry(decoy_issuer, pick_index(decoy_issuer)),
             }
         )
 
@@ -669,7 +702,11 @@ def verify_urs_dvs(
     *,
     expected_context: Dict[str, Any],
     expected_schema: List[str],
+    status_check: Optional[Callable[[str, int], bool]] = None,
 ) -> Tuple[bool, bool]:
+    """status_check(issuer_key_hex, index) tells whether that entry is
+    unrevoked in the issuer's current status list; without it only the form
+    of every status entry is checked."""
     try:
         verifier_vk = _to_pub(verifier_sk)
         base = PublicKey(bytes.fromhex(bundle["h"]))
@@ -716,10 +753,13 @@ def verify_urs_dvs(
         ):
             return False, False
 
-        status_ok = all(
-            parsed["credential_status"]["state"] == "ok"
-            for parsed in parsed_messages
-        )
+        status_ok = all(_status_well_formed(parsed) for parsed in parsed_messages)
+        if status_ok and status_check is not None:
+            status_ok = all(
+                status_check(parsed["issuer_public_key"],
+                             parsed["credential_status"]["statusListIndex"])
+                for parsed in parsed_messages
+            )
         if not status_ok:
             return False, False
 
@@ -788,11 +828,7 @@ if __name__ == "__main__":
         **attrs,
         "issuer_public_key": _point_bytes(issuer_sk).hex(),
         "holder_public_key": _point_bytes(holder_sk).hex(),
-        "credential_status": {
-            "entry": "authentic",
-            "state": "ok",
-            "source": "issuer",
-        },
+        "credential_status": status_entry(_point_bytes(issuer_sk).hex(), 1234),
     }
     issuer_signature = issue_credential(issuer_sk, genuine)
     bundle = sign_urs_dvs(
